@@ -1,0 +1,46 @@
+{
+  "name": "@facturero/outbox-relay",
+  "version": "0.1.0",
+  "description": "Modulo de resiliencia de eventos sobre el patron Outbox + RabbitMQ: publish inmediato tras el commit de la transaccion (con la tabla outbox como red de seguridad), reconexion con backoff, y una escalera de reintentos (inmediatos -> cola de retry -> dead letter) para consumidores.",
+  "license": "UNLICENSED",
+  "private": false,
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "publishConfig": {
+    "registry": "https://npm.pkg.github.com",
+    "access": "restricted"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "clean": "rimraf dist",
+    "prepublishOnly": "npm run clean && npm run build",
+    "typecheck": "tsc -p tsconfig.json --noEmit"
+  },
+  "peerDependencies": {
+    "sequelize": "^6.37.5",
+    "mysql2": "^3.11.5"
+  },
+  "peerDependenciesMeta": {
+    "mysql2": {
+      "optional": false
+    }
+  },
+  "dependencies": {
+    "amqplib": "^0.10.4"
+  },
+  "devDependencies": {
+    "@types/amqplib": "^0.10.5",
+    "@types/node": "^20.0.0",
+    "mysql2": "^3.11.5",
+    "rimraf": "^6.0.1",
+    "sequelize": "^6.37.5",
+    "typescript": "^5.7.2"
+  }
+}
