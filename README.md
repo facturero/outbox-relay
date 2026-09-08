@@ -190,6 +190,53 @@ en ese momento), el consumidor hace `nack(msg, false, true)` en vez de
 `ack` — el evento se reintenta mas tarde en vez de perderse sin dejar
 registro en ningun lado.
 
+## Actualizar a 0.2.0 (BREAKING a nivel de topologia AMQP)
+
+Hasta 0.1.0 el circuito de retry era **compartido**: un unico exchange
+`${exchange}.retry` al que TODAS las colas `<queue>.retry` se bindeaban con
+`#`, y cada una devolvia el mensaje al exchange principal por
+dead-letter. Consecuencia: un solo evento que fallara en UN consumidor se
+copiaba a las N colas de espera y, al vencer el TTL, se reinyectaba N veces
+en `${exchange}` — es decir, a **todos** los servicios. Los consumidores que
+usan `InboxConsumer` lo absorbian por idempotencia (`processed_events`), pero
+cualquier consumidor sin deduplicacion (p.ej. un `channel.consume` propio)
+procesaba el evento repetido.
+
+Desde 0.2.0 el circuito es **por consumidor** y nada de lo que circula por el
+sale al exchange comun:
+
+| | 0.1.0 | 0.2.0 |
+|---|---|---|
+| Exchange de retry | `${exchange}.retry` (compartido) | `${queue}.retry` (privado) |
+| Cola de espera | `${queue}.retry`, bindeada con `#` | `${queue}.retry.wait`, bindeada con `retry` |
+| Vuelta del retry | dead-letter a `${exchange}` (a todos) | dead-letter a `${queue}.return` (solo a este consumidor) |
+
+La routing key original ya no viaja en `fields.routingKey` durante el rebote
+(la cola de espera usa una key fija), asi que se propaga en el header
+`x-relay-original-routing-key` y `handleMessage` la restaura. Para el handler
+no cambia nada.
+
+**Paso manual al desplegar:** la cola `<queue>.retry` heredada tiene
+argumentos incompatibles con la nueva (`deadLetterExchange` distinto), por eso
+la de espera pasa a llamarse `<queue>.retry.wait` — asi el `assertQueue` no
+falla y el despliegue no entra en bucle. Las viejas quedan huerfanas y hay que
+borrarlas a mano una vez drenadas:
+
+```bash
+# Listar las heredadas
+rabbitmqctl list_queues name messages | grep '\.retry$'
+# Borrar cada una cuando este a 0 (ya nadie publica en ellas)
+rabbitmqctl delete_queue <servicio>.<cola>.retry
+```
+
+## Handler catch-all
+
+`EventHandler.eventType` acepta `CATCH_ALL_EVENT_TYPE` (`'#'`): se invoca
+cuando ninguna routing key exacta coincide. Es para consumidores que deben
+procesar **todo** lo que llegue (una bitacora de auditoria) sin mantener un
+catalogo de eventos que se queda viejo en silencio cada vez que alguien
+publica un evento nuevo. La busqueda exacta tiene prioridad sobre el comodin.
+
 ## Lo que este paquete NO hace (a proposito)
 
 - No reemplaza el observability stack (SigNoz/OTel) que ya corre — no trae

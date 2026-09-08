@@ -3,8 +3,14 @@ import { QueryTypes, Sequelize } from 'sequelize';
 import { ReconnectConfig, ReconnectLoop } from './backoff';
 import { createConsoleLogger, Logger } from './logger';
 
+/** Handler comodin: se usa cuando ninguna routing key exacta coincide. Pensado
+ *  para consumidores catch-all (bitacora de auditoria) que deben procesar todo
+ *  lo que llegue sin mantener un catalogo de eventos que se queda viejo. */
+export const CATCH_ALL_EVENT_TYPE = '#';
+
 export interface EventHandler {
-  /** Routing key exacta que dispara este handler (ej. 'product.product.created'). */
+  /** Routing key exacta que dispara este handler (ej. 'product.product.created'),
+   *  o `CATCH_ALL_EVENT_TYPE` ('#') para atender lo que no case con ninguna. */
   eventType: string;
   handle: (payload: unknown, msg: ConsumeMessage) => Promise<void>;
 }
@@ -54,6 +60,14 @@ export interface InboxConsumerConfig {
 
 const HEADER_REDELIVERY_COUNT = 'x-relay-redelivery-count';
 
+/** La routing key original no sobrevive al rebote por la cola de espera (que
+ *  usa una key fija propia del consumidor), asi que viaja en un header. */
+const HEADER_ORIGINAL_ROUTING_KEY = 'x-relay-original-routing-key';
+
+/** Key fija con la que se mueve un mensaje dentro del circuito de retry de UN
+ *  consumidor. No es una routing key de negocio: nunca sale al exchange comun. */
+const RETRY_ROUTING_KEY = 'retry';
+
 /**
  * Consumidor con escalera de reintentos: inmediatos (in-process) -> cola de
  * retry con TTL+DLX (delay antes de reintentar) -> estado `failed` en la
@@ -77,6 +91,7 @@ export class InboxConsumer {
   private readonly tableName: string;
   private readonly retryQueue: string;
   private readonly retryExchange: string;
+  private readonly returnExchange: string;
   private readonly retry: Required<RetryConfig>;
   private readonly onFailure?: InboxConsumerConfig['onFailure'];
   private readonly logger: Logger;
@@ -94,8 +109,16 @@ export class InboxConsumer {
     this.bindings = config.bindings;
     this.handlers = new Map(config.handlers.map((h) => [h.eventType, h]));
     this.tableName = config.tableName ?? 'processed_events';
-    this.retryQueue = `${config.queue}.retry`;
-    this.retryExchange = `${config.exchange}.retry`;
+    // TODO el circuito de retry es POR CONSUMIDOR. Antes se compartia un unico
+    // `${exchange}.retry` al que todas las colas `.retry` se bindeaban con '#',
+    // y cada una devolvia el mensaje al exchange principal: un solo fallo en un
+    // servicio reinyectaba el evento N veces a TODOS los consumidores.
+    // El nombre de la cola de espera cambia (`.retry` -> `.retry.wait`) porque
+    // los argumentos ya no son compatibles y `assertQueue` fallaria sobre la
+    // cola vieja. Ver README: hay que borrar las `*.retry` heredadas.
+    this.retryQueue = `${config.queue}.retry.wait`;
+    this.retryExchange = `${config.queue}.retry`;
+    this.returnExchange = `${config.queue}.return`;
     this.retry = {
       immediateAttempts: config.retry?.immediateAttempts ?? 3,
       immediateDelayMs: config.retry?.immediateDelayMs ?? 500,
@@ -127,24 +150,29 @@ export class InboxConsumer {
     this.channel = await this.model.createChannel();
 
     await this.channel.assertExchange(this.exchange, 'topic', { durable: true });
+    // Ambos exchanges son privados de ESTE consumidor: nada de lo que circule
+    // por ellos puede alcanzar a otro servicio.
     await this.channel.assertExchange(this.retryExchange, 'direct', { durable: true });
+    await this.channel.assertExchange(this.returnExchange, 'direct', { durable: true });
 
     await this.channel.assertQueue(this.queue, { durable: true });
     for (const pattern of this.bindings) {
       await this.channel.bindQueue(this.queue, this.exchange, pattern);
     }
+    // La vuelta del retry entra por aqui, no por el exchange comun.
+    await this.channel.bindQueue(this.queue, this.returnExchange, RETRY_ROUTING_KEY);
 
-    // Cola de retry: sin consumidor propio, expira por TTL y su
-    // dead-letter-exchange la devuelve al exchange principal con la misma
-    // routing key -> vuelve a la cola principal para reintentar. Esto es
-    // solo el mecanismo de "esperar antes de reintentar"; no tiene relacion
-    // con el estado final (ese vive en la DB, ver markOutcome()).
+    // Cola de espera: sin consumidor propio, expira por TTL y su
+    // dead-letter-exchange la devuelve SOLO a la cola de este consumidor.
+    // Es unicamente el mecanismo de "esperar antes de reintentar"; el estado
+    // final vive en la DB (ver markOutcome()).
     await this.channel.assertQueue(this.retryQueue, {
       durable: true,
-      deadLetterExchange: this.exchange,
+      deadLetterExchange: this.returnExchange,
+      deadLetterRoutingKey: RETRY_ROUTING_KEY,
       messageTtl: this.retry.retryTtlMs,
     });
-    await this.channel.bindQueue(this.retryQueue, this.retryExchange, '#');
+    await this.channel.bindQueue(this.retryQueue, this.retryExchange, RETRY_ROUTING_KEY);
 
     this.model.on('close', () => {
       if (this.stopped) return;
@@ -169,7 +197,15 @@ export class InboxConsumer {
   }
 
   private async handleMessage(msg: ConsumeMessage): Promise<void> {
-    const routingKey = msg.fields.routingKey;
+    // Si el mensaje vuelve de la cola de espera, `fields.routingKey` es la key
+    // interna del circuito de retry; la de negocio viaja en el header.
+    const routingKey =
+      (msg.properties.headers?.[HEADER_ORIGINAL_ROUTING_KEY] as string | undefined) ??
+      msg.fields.routingKey;
+    // Los handlers reciben el `msg` crudo y muchos leen `fields.routingKey`
+    // para saber que evento es. Se restaura la key de negocio para que un
+    // reintento sea indistinguible de la primera entrega.
+    msg.fields.routingKey = routingKey;
     const eventId = msg.properties.headers?.eventId as string | undefined;
 
     if (eventId && (await this.alreadyProcessed(eventId))) {
@@ -177,7 +213,7 @@ export class InboxConsumer {
       return;
     }
 
-    const handler = this.handlers.get(routingKey);
+    const handler = this.handlers.get(routingKey) ?? this.handlers.get(CATCH_ALL_EVENT_TYPE);
     if (!handler) {
       this.logger.warn('sin handler para este evento, se descarta', { routingKey });
       this.channel!.ack(msg);
@@ -209,9 +245,13 @@ export class InboxConsumer {
     const redeliveryCount = (msg.properties.headers?.[HEADER_REDELIVERY_COUNT] as number) ?? 0;
 
     if (redeliveryCount < this.retry.maxRedeliveries) {
-      this.channel!.publish(this.retryExchange, routingKey, msg.content, {
+      this.channel!.publish(this.retryExchange, RETRY_ROUTING_KEY, msg.content, {
         persistent: true,
-        headers: { ...msg.properties.headers, [HEADER_REDELIVERY_COUNT]: redeliveryCount + 1 },
+        headers: {
+          ...msg.properties.headers,
+          [HEADER_REDELIVERY_COUNT]: redeliveryCount + 1,
+          [HEADER_ORIGINAL_ROUTING_KEY]: routingKey,
+        },
       });
       this.logger.warn('escalado a cola de retry', { routingKey, redeliveryCount: redeliveryCount + 1 });
       this.channel!.ack(msg);
@@ -234,6 +274,11 @@ export class InboxConsumer {
         routingKey,
         err: err instanceof Error ? err.message : String(err),
       });
+      // Se espera ANTES de devolverlo a la cola. Sin la pausa, un fallo
+      // permanente al escribir en la tabla (no solo un blip de conexion) hacia
+      // girar el mensaje miles de veces por minuto contra la DB. Se sigue
+      // prefiriendo reencolar a perder el evento, pero a ritmo humano.
+      await this.delay(this.retry.retryTtlMs);
       this.channel!.nack(msg, false, true);
     }
   }
@@ -259,20 +304,28 @@ export class InboxConsumer {
     status: 'processed' | 'failed',
     lastError: string | null,
   ): Promise<void> {
+    // Se recorta a la anchura de las columnas ANTES de insertar. Sin esto, un
+    // routing key largo (event_type es VARCHAR(100)) hacia fallar el INSERT; el
+    // catch de handleMessage lo interpretaba como fallo transitorio y hacia
+    // nack(requeue) -> el mensaje volvia, fallaba igual, y se quedaba en un
+    // bucle caliente para siempre. Justo la clase de mensaje envenenado que
+    // este paquete existe para evitar. Los dos campos son copias del routing
+    // key para consulta, no claves: recortarlos no pierde nada relevante.
     await this.sequelize.query(
       `INSERT INTO ${this.tableName} (id, event_type, routing_key, payload, status, last_error, processed_at)
-       VALUES (:id, :eventType, :eventType, :payload, :status, :lastError, NOW())
+       VALUES (:id, :eventType, :routingKey, :payload, :status, :lastError, NOW())
        ON DUPLICATE KEY UPDATE
          status = VALUES(status),
          last_error = VALUES(last_error),
          processed_at = VALUES(processed_at)`,
       {
         replacements: {
-          id: eventId,
-          eventType,
+          id: eventId.slice(0, 36),
+          eventType: eventType.slice(0, 100),
+          routingKey: eventType.slice(0, 200),
           payload: JSON.stringify(payload),
           status,
-          lastError,
+          lastError: lastError === null ? null : lastError.slice(0, 2000),
         },
         type: QueryTypes.INSERT,
       },

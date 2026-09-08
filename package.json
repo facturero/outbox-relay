@@ -1,6 +1,6 @@
 {
   "name": "@facturero/outbox-relay",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Modulo de resiliencia de eventos sobre el patron Outbox + RabbitMQ: publish inmediato tras el commit de la transaccion (con la tabla outbox como red de seguridad), reconexion con backoff, y una escalera de reintentos (inmediatos -> cola de retry -> dead letter) para consumidores.",
   "license": "UNLICENSED",
   "private": false,
