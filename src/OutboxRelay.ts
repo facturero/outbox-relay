@@ -140,7 +140,22 @@ export class OutboxRelay {
   private async drain(): Promise<void> {
     if (!this.channel) return;
 
-    await this.sequelize.transaction(async (t) => {
+    // READ COMMITTED (no el REPEATABLE READ por defecto) a proposito: bajo
+    // REPEATABLE READ, el FOR UPDATE de mas abajo sobre `processed_at IS
+    // NULL` toma un next-key lock que cubre el "bucket" NULL del indice
+    // secundario, y bloquea cualquier INSERT nuevo con processed_at NULL
+    // (o sea, cada evento nuevo que otro proceso intente encolar) mientras
+    // esta transaccion siga abierta - incluyendo el tiempo que tarda el
+    // loop de publish() a RabbitMQ de aqui abajo. Bajo READ COMMITTED,
+    // InnoDB no toma gap locks en busquedas por indice secundario no unico,
+    // solo bloquea las filas que realmente selecciona - el SKIP LOCKED
+    // sigue evitando que dos replicas publiquen el mismo evento dos veces,
+    // pero deja de frenar los INSERT de otros procesos. Medido en
+    // stress-petitions/billing: sin esto, un INSERT concurrente a un drain()
+    // en curso esperaba el commit completo (hasta varios segundos bajo
+    // carga); con esto, no espera al lock de rango, solo al de fila si
+    // coincide una en curso (raro, y ya cubierto por SKIP LOCKED).
+    await this.sequelize.transaction({ isolationLevel: Transaction.ISOLATION_LEVELS.READ_COMMITTED }, async (t) => {
       const rows = await this.sequelize.query<OutboxRow>(
         `SELECT id, type, payload FROM ${this.tableName}
           WHERE processed_at IS NULL
