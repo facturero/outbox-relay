@@ -76,6 +76,8 @@ export const relay = new OutboxRelay({
   exchange: 'crm.events',
   // tableName: 'outbox_messages',       // default
   // batchSize: 50,                      // default
+  // drainDelayMs: 100,                  // default; ventana para agrupar commits en un
+  //                                      // solo lote (0 = drenar al instante)
   // safetyNetIntervalMs: 30_000,        // default; ya no es el mecanismo
   //                                      // principal, ver mas abajo
   // reconnect: { initialDelayMs: 5000, maxDelayMs: 60_000 }, // default
@@ -106,6 +108,14 @@ como red de seguridad para el caso borde: el proceso muere entre el commit
 y el `notify()`, o RabbitMQ no estaba disponible en ese momento — en ambos
 casos la fila queda con `processed_at IS NULL` y el timer (o la reconexion)
 la recoge despues.
+
+`notify()` no drena en el acto: espera `drainDelayMs` (100ms por defecto) y todos
+los commits que lleguen en esa ventana comparten UN solo drain (una transaccion,
+un commit, un UPDATE para todo el lote). Medido en billing a ~27 RPS, drenar al
+instante costaba ~1 commit extra por factura (fsync de redo + binlog) y el disco
+era el cuello. El costo es que un evento sale hasta `drainDelayMs` despues del
+commit; con `drainDelayMs: 0` vuelve el comportamiento de 0.2.2. Si un lote sale
+lleno, el siguiente drain va sin demora para vaciar el backlog.
 
 `drain()` usa `SELECT ... FOR UPDATE SKIP LOCKED`, asi que es seguro correr
 con varias replicas del mismo servicio sin publicar el mismo evento dos

@@ -19,6 +19,13 @@ export interface OutboxRelayConfig {
    *  notify() cubre el caso normal - solo cubre el caso borde en que el
    *  proceso muere entre el commit y el notify(). Default 30000ms. */
   safetyNetIntervalMs?: number;
+  /** Ventana (ms) que notify() espera antes de drenar, para que los commits que
+   *  lleguen dentro de ella compartan UN solo lote (una transaccion, un commit,
+   *  un fsync) en vez de uno por evento. Medido en billing a ~27 RPS: cada
+   *  commit disparaba su propio drain, o sea ~1 commit extra por factura, y el
+   *  disco (fsync de redo + binlog) era el cuello. 0 = drenar al instante (el
+   *  comportamiento de 0.2.2). Default 100ms: el evento sale con esa demora. */
+  drainDelayMs?: number;
   reconnect?: ReconnectConfig;
   logger?: Logger;
 }
@@ -49,6 +56,7 @@ export class OutboxRelay {
   private readonly tableName: string;
   private readonly batchSize: number;
   private readonly safetyNetIntervalMs: number;
+  private readonly drainDelayMs: number;
   private readonly logger: Logger;
   private readonly reconnectLoop: ReconnectLoop;
 
@@ -57,6 +65,9 @@ export class OutboxRelay {
   private safetyNetTimer: ReturnType<typeof setInterval> | null = null;
   private draining = false;
   private drainAgain = false;
+  /** Quedan filas de sobra tras un lote lleno: el siguiente drain va sin demora. */
+  private drainBacklog = false;
+  private drainTimer: ReturnType<typeof setTimeout> | null = null;
   private stopped = false;
 
   constructor(config: OutboxRelayConfig) {
@@ -66,6 +77,7 @@ export class OutboxRelay {
     this.tableName = config.tableName ?? 'outbox_messages';
     this.batchSize = config.batchSize ?? 50;
     this.safetyNetIntervalMs = config.safetyNetIntervalMs ?? 30_000;
+    this.drainDelayMs = config.drainDelayMs ?? 100;
     this.logger = config.logger ?? createConsoleLogger('[outbox-relay]');
     this.reconnectLoop = new ReconnectLoop(() => this.connectOnce(), config.reconnect);
   }
@@ -85,6 +97,8 @@ export class OutboxRelay {
     this.stopped = true;
     this.reconnectLoop.stop();
     if (this.safetyNetTimer) clearInterval(this.safetyNetTimer);
+    if (this.drainTimer) clearTimeout(this.drainTimer);
+    this.drainTimer = null;
     await this.channel?.close().catch(() => undefined);
     await this.model?.close().catch(() => undefined);
   }
@@ -104,12 +118,34 @@ export class OutboxRelay {
       this.drainAgain = true;
       return;
     }
+    if (this.drainDelayMs > 0 && !this.drainBacklog) {
+      // Ya hay un drain agendado: este evento entra en ese mismo lote.
+      if (this.drainTimer) return;
+      this.drainTimer = setTimeout(() => {
+        this.drainTimer = null;
+        this.runDrain();
+      }, this.drainDelayMs);
+      return;
+    }
+    this.runDrain();
+  }
+
+  private runDrain(): void {
+    if (this.draining) {
+      this.drainAgain = true;
+      return;
+    }
     this.draining = true;
+    this.drainBacklog = false;
     this.drain()
       .catch((err) => this.logger.error('error al drenar outbox', { err: String(err) }))
       .finally(() => {
         this.draining = false;
-        if (this.drainAgain) {
+        if (this.drainBacklog) {
+          // Lote lleno: quedan filas pendientes, se sigue sin demora.
+          this.runDrain();
+        } else if (this.drainAgain) {
+          // Llegaron commits mientras drenaba: nuevo lote, con la ventana de agrupacion.
           this.drainAgain = false;
           this.notify();
         }
@@ -165,6 +201,7 @@ export class OutboxRelay {
         { replacements: { batchSize: this.batchSize }, type: QueryTypes.SELECT, transaction: t },
       );
 
+      const publishedIds: string[] = [];
       for (const row of rows) {
         const published = this.channel!.publish(
           this.exchange,
@@ -179,16 +216,23 @@ export class OutboxRelay {
           });
           continue;
         }
+        publishedIds.push(row.id);
+      }
 
+      // Un solo UPDATE para todo el lote: antes era uno por fila, o sea N idas y
+      // vueltas a MySQL con la transaccion (y sus locks) abierta.
+      if (publishedIds.length > 0) {
         await this.sequelize.query(
-          `UPDATE ${this.tableName} SET processed_at = NOW() WHERE id = :id`,
-          { replacements: { id: row.id }, type: QueryTypes.UPDATE, transaction: t },
+          `UPDATE ${this.tableName} SET processed_at = NOW() WHERE id IN (:ids)`,
+          { replacements: { ids: publishedIds }, type: QueryTypes.UPDATE, transaction: t },
         );
       }
 
-      if (rows.length === this.batchSize) {
+      if (rows.length === this.batchSize && publishedIds.length > 0) {
         // Puede haber mas filas de las que trajo el batch: seguir drenando.
-        this.drainAgain = true;
+        // (Solo si se publico algo: con todo en backpressure reintentar al instante
+        // seria un bucle caliente.)
+        this.drainBacklog = true;
       }
     });
   }
