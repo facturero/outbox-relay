@@ -3,3 +3,6 @@ dist/
 *.log
 .env
 .npmrc
+
+# Salida de `npm pack`: es el artefacto que se publica, no fuente.
+*.tgz
